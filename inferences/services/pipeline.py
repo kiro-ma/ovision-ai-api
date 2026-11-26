@@ -1,0 +1,744 @@
+import os
+import re
+import json
+from pathlib import Path
+from typing import Any, Optional
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MODEL_PATH = "./runs/pose/ovision-yolo/caprine-bovidae-v4-strict-clean/weights/best.pt"
+
+# Mapeamento oficial dos 17 Keypoints do AP-10K
+AP10K_KEYPOINTS = [
+    "left_eye",        # 0
+    "right_eye",       # 1
+    "nose",            # 2
+    "neck",            # 3 (região cernelha/pescoço)
+    "root_of_tail",    # 4 (região garupa/cauda)
+    "left_shoulder",   # 5
+    "left_elbow",      # 6
+    "left_front_paw",  # 7
+    "right_shoulder",  # 8
+    "right_elbow",     # 9
+    "right_front_paw", # 10
+    "left_hip",        # 11
+    "left_knee",       # 12
+    "left_back_paw",   # 13
+    "right_hip",       # 14
+    "right_knee",      # 15
+    "right_back_paw",  # 16
+]
+
+# Esqueleto anatômico quadrupedal com agrupamento por região
+SKELETON_GROUPS = [
+    # Cabeça (Ciano)
+    {"color": (255, 255, 0), "pairs": [(0, 1), (0, 2), (1, 2), (2, 3)]},
+    # Coluna / Tronco (Amarelo)
+    {"color": (0, 215, 255), "pairs": [(3, 4)]},
+    # Membros Anteriores / Dianteiros (Verde)
+    {"color": (0, 255, 0), "pairs": [(3, 5), (5, 6), (6, 7), (3, 8), (8, 9), (9, 10)]},
+    # Membros Posteriores / Traseiros (Magenta)
+    {"color": (255, 0, 255), "pairs": [(4, 11), (11, 12), (12, 13), (4, 14), (14, 15), (15, 16)]},
+]
+
+# Constante de calibração óptica da câmera (pixels * cm_distância / cm_real)
+FOCAL_CALIBRATION_CONSTANT = 3350.0
+BASE_IMAGE_WIDTH = 4080.0
+
+
+def extrair_valor_gabarito(dados: Optional[dict[str, Any]], *chaves: str) -> Optional[float]:
+    """Auxiliar para extrair valores do JSON de validação aceitando variações de nomenclatura."""
+    if not dados:
+        return None
+    for chave in chaves:
+        if chave in dados and dados[chave] is not None:
+            try:
+                return float(dados[chave])
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def deduzir_distancia_camera(caminho_imagem: str, dist_padrao: float = 160.0) -> float:
+    """Deduz a distância da câmera em centímetros se constar no nome do arquivo (ex: 'dist160')."""
+    if not caminho_imagem:
+        return dist_padrao
+    match = re.search(r"dist(\d+)", os.path.basename(caminho_imagem))
+    if match:
+        return float(match.group(1))
+    return dist_padrao
+
+
+def extrair_identificador_modelo(model_path: str) -> tuple[str, str]:
+    """
+    Extrai o identificador curto do modelo (o que vem depois de 'vX-', ou o próprio 'vX'
+    se não houver sufixo) e o nome completo da pasta do experimento.
+
+    Exemplos:
+      'runs/pose/ovision-yolo/caprine-bovidae-v2-oclusao/weights/best.pt' -> ('oclusao', 'caprine-bovidae-v2-oclusao')
+      'runs/pose/ovision-yolo/caprine-bovidae-v1/weights/best.pt'         -> ('v1', 'caprine-bovidae-v1')
+      'runs/pose/ovision-yolo/caprine-bovidae-v4-strict-clean/weights/best.pt' -> ('strict-clean', 'caprine-bovidae-v4-strict-clean')
+    """
+    caminho_norm = os.path.normpath(model_path)
+    partes = caminho_norm.split(os.sep)
+
+    if len(partes) >= 3 and partes[-2].lower() == "weights":
+        nome_run = partes[-3]
+    else:
+        nome_run = os.path.splitext(os.path.basename(caminho_norm))[0]
+
+    match = re.search(r"(v\d+)(?:-(.+))?$", nome_run, flags=re.IGNORECASE)
+    if match:
+        versao, sufixo = match.group(1), match.group(2)
+        tag_curta = sufixo if sufixo else versao
+    else:
+        tag_curta = nome_run
+
+    return tag_curta, nome_run
+
+
+def gerar_caminho_saida_incremental(image_path: str, tag_modelo: str, out_dir: str = "outputs") -> str:
+    """
+    Gera o caminho de saída mantendo o nome original da imagem + '_{tag_modelo}-{n}',
+    incrementando 'n' (1, 2, 3...) automaticamente se o arquivo já existir.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    nome_base, ext = os.path.splitext(os.path.basename(image_path))
+    if not ext:
+        ext = ".jpg"
+
+    contador = 1
+    while True:
+        nome_arquivo = f"pose_{nome_base}_{tag_modelo}-{contador}{ext}"
+        caminho_completo = os.path.join(out_dir, nome_arquivo)
+        if not os.path.exists(caminho_completo):
+            return caminho_completo
+        contador += 1
+
+
+def calcular_distancia(p1, p2) -> float:
+    return float(np.linalg.norm(np.array(p1) - np.array(p2)))
+
+
+def calcular_peso_schaeffer_kg(comprimento_cm: float, circ_torax_cm: float) -> float:
+    """
+    Calcula o peso vivo em kg usando a fórmula de Schaeffer adaptada para o sistema métrico (cm):
+    Original: W (lbs) = (BL_in * CG_in^2) / 300
+    Conversões:
+      1 polegada (in) = 2.54 cm
+      1 kg = 2.20462 lbs
+    Equivalente direto em cm: W (kg) = (BL_cm * CG_cm^2) / 10838.18
+    """
+    bl_in = comprimento_cm / 2.54
+    cg_in = circ_torax_cm / 2.54
+    peso_lbs = (bl_in * (cg_in ** 2)) / 300.0
+    return peso_lbs / 2.20462
+
+
+def _avaliar_cadeia_membro(proximal, medial, distal, min_conf: float = 0.35) -> dict[str, Any]:
+    """
+    Avalia a consistência biomecânica de um membro (ombro/quadril -> cotovelo/joelho -> pata).
+    Retorna um dicionário com métricas de qualidade, verticalidade da canela e estimativa do solo.
+    """
+    if distal[2] < min_conf:
+        return {"valido": False, "score": 0.0, "y_apoio": None}
+
+    conf_chain = (0.20 * proximal[2]) + (0.30 * medial[2]) + (0.50 * distal[2])
+    ordem_gravidade = (
+        (proximal[1] < medial[1] < distal[1])
+        if (proximal[2] >= min_conf and medial[2] >= min_conf)
+        else True
+    )
+
+    if medial[2] >= min_conf:
+        dx_canela = abs(distal[0] - medial[0])
+        dy_canela = max(1.0, distal[1] - medial[1])
+        comp_canela = float(np.hypot(dx_canela, dy_canela))
+        verticalidade = dy_canela / comp_canela if distal[1] > medial[1] else 0.2
+    else:
+        comp_canela = 0.0
+        verticalidade = 0.7
+
+    if proximal[2] >= min_conf and medial[2] >= min_conf:
+        comp_sup = calcular_distancia(proximal[:2], medial[:2])
+    else:
+        comp_sup = comp_canela
+
+    penalidade_geometria = 1.0 if (ordem_gravidade and verticalidade >= 0.82) else 0.55
+    score = conf_chain * verticalidade * penalidade_geometria
+
+    return {
+        "valido": True,
+        "score": float(score),
+        "verticalidade": float(verticalidade),
+        "y_apoio": float(distal[1]),
+        "x_apoio": float(distal[0]),
+        "x_medial": float(medial[0]) if medial[2] >= min_conf else float(distal[0]),
+        "comp_canela": float(comp_canela),
+        "comp_sup": float(comp_sup),
+    }
+
+
+def selecionar_apoio_biomecanico(
+    prox_l,
+    med_l,
+    dist_l,
+    prox_r,
+    med_r,
+    dist_r,
+    comp_tronco_px: Optional[float] = None,
+    min_conf: float = 0.35,
+):
+    """
+    Filtro biomecânico inteligente para selecionar a coordenada Y de apoio no solo:
+    1. Avalia a cadeia articular Esquerda e Direita (confiança + verticalidade + gravidade).
+    2. Detecta se houve colapso espacial ou cruzamento em 'X' entre a perna esquerda e direita.
+    3. Compensa pernas "curtas" (quando o keypoint para no boleto em vez do casco).
+    """
+    av_l = _avaliar_cadeia_membro(prox_l, med_l, dist_l, min_conf=min_conf)
+    av_r = _avaliar_cadeia_membro(prox_r, med_r, dist_r, min_conf=min_conf)
+
+    if not av_l["valido"] and not av_r["valido"]:
+        return None, {"colapsado": True, "score": 0.0}
+    if av_l["valido"] and not av_r["valido"]:
+        return av_l["y_apoio"], {"colapsado": True, "score": av_l["score"], "eleito": av_l}
+    if av_r["valido"] and not av_l["valido"]:
+        return av_r["y_apoio"], {"colapsado": True, "score": av_r["score"], "eleito": av_r}
+
+    sep_patas_x = abs(av_l["x_apoio"] - av_r["x_apoio"])
+    sep_medial_x = abs(av_l["x_medial"] - av_r["x_medial"])
+    limiar_colapso_x = (comp_tronco_px * 0.045) if comp_tronco_px else 40.0
+
+    cruzamento_x = ((av_l["x_medial"] - av_r["x_medial"]) * (av_l["x_apoio"] - av_r["x_apoio"])) < 0
+    colapsado = (sep_patas_x < limiar_colapso_x) or (sep_medial_x < limiar_colapso_x * 0.6) or cruzamento_x
+
+    melhor = av_l if av_l["score"] >= av_r["score"] else av_r
+    outro = av_r if melhor is av_l else av_l
+
+    if melhor["score"] > outro["score"] * 1.15:
+        y_eleito = melhor["y_apoio"]
+    elif colapsado:
+        y_base = max(av_l["y_apoio"], av_r["y_apoio"])
+        deficit_canela = max(0.0, (melhor["comp_sup"] * 1.05) - melhor["comp_canela"])
+        y_eleito = y_base + min(deficit_canela * 0.35, melhor["comp_sup"] * 0.12)
+    else:
+        y_max = max(av_l["y_apoio"], av_r["y_apoio"])
+        y_min = min(av_l["y_apoio"], av_r["y_apoio"])
+        y_eleito = (0.70 * y_max) + (0.30 * y_min)
+
+    return float(y_eleito), {"colapsado": colapsado, "score": melhor["score"], "eleito": melhor}
+
+
+def estimar_biometria_autonoma(kpts, dist_cm: float = 160.0, img_w: float = 4080.0) -> dict[str, float]:
+    """Estima as medidas corporais e o peso vivo do animal a partir dos keypoints com filtro biomecânico."""
+    pts = {AP10K_KEYPOINTS[i]: (kpts[i][0], kpts[i][1], kpts[i][2]) for i in range(len(kpts))}
+    min_conf = 0.35
+
+    focal_ajustado = FOCAL_CALIBRATION_CONSTANT * (img_w / BASE_IMAGE_WIDTH)
+    px_per_cm = focal_ajustado / dist_cm
+
+    comp_tronco_px = None
+    if pts["neck"][2] >= min_conf and pts["root_of_tail"][2] >= min_conf:
+        comp_tronco_px = calcular_distancia(pts["neck"][:2], pts["root_of_tail"][:2])
+
+    pata_diant_y, info_diant = selecionar_apoio_biomecanico(
+        pts["left_shoulder"], pts["left_elbow"], pts["left_front_paw"],
+        pts["right_shoulder"], pts["right_elbow"], pts["right_front_paw"],
+        comp_tronco_px=comp_tronco_px, min_conf=min_conf,
+    )
+    pata_tras_y, info_tras = selecionar_apoio_biomecanico(
+        pts["left_hip"], pts["left_knee"], pts["left_back_paw"],
+        pts["right_hip"], pts["right_knee"], pts["right_back_paw"],
+        comp_tronco_px=comp_tronco_px, min_conf=min_conf,
+    )
+
+    if pata_diant_y is not None and pata_tras_y is not None and comp_tronco_px is not None:
+        desnivel_max_natural = comp_tronco_px * 0.06
+        diff_solo = pata_tras_y - pata_diant_y
+        if info_tras["colapsado"] and not info_diant["colapsado"] and abs(diff_solo) > desnivel_max_natural:
+            pata_tras_y = (0.45 * pata_tras_y) + (0.55 * pata_diant_y)
+        elif info_diant["colapsado"] and not info_tras["colapsado"] and abs(diff_solo) > desnivel_max_natural:
+            pata_diant_y = (0.45 * pata_diant_y) + (0.55 * pata_tras_y)
+    elif pata_diant_y is None and pata_tras_y is not None:
+        pata_diant_y = pata_tras_y
+    elif pata_tras_y is None and pata_diant_y is not None:
+        pata_tras_y = pata_diant_y
+    elif pata_diant_y is None and pata_tras_y is None:
+        ys_membros = [kpts[i][1] for i in range(5, 17) if kpts[i][1] > 0]
+        if ys_membros:
+            y_solo_fb = float(max(ys_membros))
+            pata_diant_y = y_solo_fb
+            pata_tras_y = y_solo_fb
+
+    estimativas: dict[str, float] = {}
+
+    if pata_diant_y is not None and pts["neck"][1] > 0:
+        cernelha_px = abs(pata_diant_y - pts["neck"][1])
+        estimativas["altura_cernelha_cm"] = float(cernelha_px / px_per_cm)
+        estimativas["cernelha_px"] = float(cernelha_px)
+
+    if pata_tras_y is not None and pts["root_of_tail"][1] > 0:
+        hips_valid = (
+            [pts["left_hip"][1] for p in [pts["left_hip"]] if p[2] >= min_conf]
+            + [pts["right_hip"][1] for p in [pts["right_hip"]] if p[2] >= min_conf]
+        )
+        if hips_valid:
+            y_garupa_ref = (0.85 * pts["root_of_tail"][1]) + (0.15 * float(np.mean(hips_valid)))
+        else:
+            y_garupa_ref = pts["root_of_tail"][1]
+        garupa_px = abs(pata_tras_y - y_garupa_ref)
+        estimativas["altura_garupa_cm"] = float(garupa_px / px_per_cm)
+        estimativas["garupa_px"] = float(garupa_px)
+
+    if comp_tronco_px is None and pts["neck"][0] > 0 and pts["root_of_tail"][0] > 0:
+        comp_tronco_px = calcular_distancia(pts["neck"][:2], pts["root_of_tail"][:2])
+    if comp_tronco_px is not None:
+        comp_cm = (comp_tronco_px / px_per_cm) * 0.85
+        estimativas["comprimento_cm"] = float(comp_cm)
+        estimativas["comprimento_px"] = float(comp_tronco_px)
+
+    if pts["nose"][0] > 0 and pts["neck"][0] > 0:
+        comp_cabeca_px = calcular_distancia(pts["nose"][:2], pts["neck"][:2])
+        comp_cabeca_cm = comp_cabeca_px / px_per_cm
+        estimativas["comprimento_cabeca_cm"] = float(comp_cabeca_cm)
+        estimativas["grossura_pescoco_cm"] = float(comp_cabeca_cm * 0.72)
+
+    cernelha_cm = estimativas.get("altura_cernelha_cm", 74.0)
+    comprimento_cm = estimativas.get("comprimento_cm", 70.0)
+    perimetro_torax_cm = cernelha_cm * 1.275
+    estimativas["circ_torax_cm"] = float(perimetro_torax_cm)
+
+    peso_kg = calcular_peso_schaeffer_kg(comprimento_cm, perimetro_torax_cm)
+    estimativas["peso_estimado_kg"] = float(peso_kg)
+
+    return estimativas
+
+
+def desenhar_painel_ovision(
+    img,
+    kpts,
+    estimativas,
+    dados_validacao=None,
+    nome_modelo: Optional[str] = None,
+    bbox=None,
+    box_conf: Optional[float] = None,
+):
+    """Desenha a bounding box, o esqueleto e o painel biométrico Ovision com identificação do modelo."""
+    h, w = img.shape[:2]
+    escala = max(w, h) / 2000.0
+    line_thick = max(2, int(4 * escala))
+    radius = max(4, int(7 * escala))
+    font_scale = 0.50 * escala
+
+    painel_w = int(520 * escala)
+    espaco_linha = int(28 * escala)
+    pad = int(25 * escala)
+
+    if bbox is not None and len(bbox) >= 4:
+        bx1, by1, bx2, by2 = [int(round(v)) for v in bbox[:4]]
+        bx1, by1 = max(0, bx1), max(0, by1)
+        bx2, by2 = min(w - 1, bx2), min(h - 1, by2)
+        cor_bbox = (0, 200, 255)  # Dourado/laranja consistente com a borda do painel Ovision
+        espessura_bbox = max(2, int(3 * escala))
+        cv2.rectangle(img, (bx1, by1), (bx2, by2), cor_bbox, espessura_bbox, cv2.LINE_AA)
+
+        texto_bbox = f"Animal ({box_conf * 100:.1f}%)" if box_conf is not None else "Animal"
+        font_bbox = font_scale * 0.90
+        thick_txt_bbox = max(1, int(1.3 * escala))
+        (tw, th), baseline = cv2.getTextSize(texto_bbox, cv2.FONT_HERSHEY_SIMPLEX, font_bbox, thick_txt_bbox)
+        pad_x = max(4, int(8 * escala))
+        pad_y = max(3, int(6 * escala))
+        tag_h = th + baseline + 2 * pad_y
+        tag_w = tw + 2 * pad_x
+
+        if by1 - tag_h >= 0:
+            ty1, ty2 = by1 - tag_h, by1
+            y_texto = by1 - pad_y - baseline // 2
+        else:
+            ty1, ty2 = by1, min(h - 1, by1 + tag_h)
+            y_texto = ty1 + th + pad_y
+
+        limite_painel_x = pad + painel_w + int(15 * escala)
+        limite_painel_y = pad + int(450 * escala)
+        if bx1 < limite_painel_x and ty1 < limite_painel_y and (bx2 - tag_w) >= limite_painel_x:
+            tx2 = bx2
+            tx1 = max(0, bx2 - tag_w)
+        else:
+            tx1 = bx1
+            tx2 = min(w - 1, bx1 + tag_w)
+
+        cv2.rectangle(img, (tx1, ty1), (tx2, ty2), cor_bbox, -1)
+        cv2.putText(
+            img,
+            texto_bbox,
+            (tx1 + pad_x, y_texto),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_bbox,
+            (20, 20, 20),
+            thick_txt_bbox,
+            cv2.LINE_AA,
+        )
+
+    for grupo in SKELETON_GROUPS:
+        cor = grupo["color"]
+        for p1, p2 in grupo["pairs"]:
+            x1, y1, c1 = kpts[p1]
+            x2, y2, c2 = kpts[p2]
+            if c1 > 0.35 and c2 > 0.35:
+                cv2.line(img, (int(x1), int(y1)), (int(x2), int(y2)), cor, line_thick, cv2.LINE_AA)
+
+    for i, (x, y, conf) in enumerate(kpts):
+        if conf > 0.35:
+            cv2.circle(img, (int(x), int(y)), radius, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.circle(img, (int(x), int(y)), radius + max(1, int(2 * escala)), (255, 255, 255), 1, cv2.LINE_AA)
+            nome_ponto = AP10K_KEYPOINTS[i]
+            cv2.putText(
+                img,
+                f"{nome_ponto}",
+                (int(x) + int(10 * escala), int(y) - int(5 * escala)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale * 0.85,
+                (255, 255, 255),
+                max(1, int(1.2 * escala)),
+                cv2.LINE_AA,
+            )
+
+    linhas = [
+        ("=== OVISION: BIOMETRIA IA ===", (0, 255, 255)),
+    ]
+    if nome_modelo:
+        linhas.append((f"MODELO: {nome_modelo}", (180, 230, 255)))
+
+    linhas.extend([
+        (f"PESO ESTIMADO: {estimativas.get('peso_estimado_kg', 0):.1f} kg", (0, 255, 0)),
+        ("----------------------------------------", (150, 150, 150)),
+        (f"Alt. Cernelha:   {estimativas.get('altura_cernelha_cm', 0):.1f} cm", (255, 255, 255)),
+        (f"Alt. Garupa:     {estimativas.get('altura_garupa_cm', 0):.1f} cm", (255, 255, 255)),
+        (f"Comprimento:     {estimativas.get('comprimento_cm', 0):.1f} cm", (255, 255, 255)),
+        (f"Circ. Toracica:  {estimativas.get('circ_torax_cm', 0):.1f} cm", (255, 255, 255)),
+        (f"Gross. Pescoco:  {estimativas.get('grossura_pescoco_cm', 0):.1f} cm", (255, 255, 255)),
+    ])
+
+    if dados_validacao:
+        linhas.append(("--- VALIDAÇÃO DE TESTE (GABARITO) ---", (0, 165, 255)))
+        metricas = [
+            ("Peso", estimativas.get("peso_estimado_kg"), extrair_valor_gabarito(dados_validacao, "peso_kg", "peso", "peso_real_kg"), "kg"),
+            ("Cernelha", estimativas.get("altura_cernelha_cm"), extrair_valor_gabarito(dados_validacao, "altura_cernelha_cm", "cernelha_cm", "altura_cernelha"), "cm"),
+            ("Garupa", estimativas.get("altura_garupa_cm"), extrair_valor_gabarito(dados_validacao, "altura_garupa_cm", "garupa_cm", "altura_garupa"), "cm"),
+            ("Comprimento", estimativas.get("comprimento_cm"), extrair_valor_gabarito(dados_validacao, "comprimento_cm", "comprimento", "comprimento_corpo_cm"), "cm"),
+            ("Circ.Torax", estimativas.get("circ_torax_cm"), extrair_valor_gabarito(dados_validacao, "circ_do_torax", "circ_torax_cm", "perimetro_torax_cm", "perimetro_toracico_cm"), "cm"),
+            ("Gross.Pesc", estimativas.get("grossura_pescoco_cm"), extrair_valor_gabarito(dados_validacao, "pescoco_circ_medio", "grossura_pescoco_cm", "pescoco_cm"), "cm"),
+        ]
+        for label, est_v, real_v, und in metricas:
+            if real_v is not None and est_v is not None:
+                diff = abs(est_v - real_v)
+                linhas.append((f"{label}: Real {real_v:.1f}{und} | Diff {diff:.1f}{und}", (200, 220, 255)))
+
+    painel_h = int((35 * escala) + (len(linhas) * espaco_linha))
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (pad, pad), (pad + painel_w, pad + painel_h), (25, 25, 25), -1)
+    cv2.addWeighted(overlay, 0.80, img, 0.20, 0, img)
+    cv2.rectangle(img, (pad, pad), (pad + painel_w, pad + painel_h), (0, 200, 255), max(1, int(2 * escala)))
+
+    y_txt = pad + int(30 * escala)
+    for texto, cor in linhas:
+        cv2.putText(
+            img,
+            texto,
+            (pad + int(15 * escala), y_txt),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            cor,
+            max(1, int(1.3 * escala)),
+            cv2.LINE_AA,
+        )
+        y_txt += espaco_linha
+
+    return img
+
+
+# Alias de compatibilidade com código legado
+desenhar_painel_onevision = desenhar_painel_ovision
+
+
+def resolver_modelo_padrao(
+    caminho_preferido: str = DEFAULT_MODEL_PATH,
+    base_dir: Optional[Path] = None,
+) -> str:
+    """Retorna o modelo preferido ou faz fallback automático para o melhor checkpoint disponível."""
+    root = Path(base_dir) if base_dir is not None else REPO_ROOT
+    run_names = [
+        "caprine-bovidae-v4-strict-clean",
+        "caprine-bovidae-v2-oclusao",
+        "caprine-bovidae-v1",
+        "caprine-v5-head-clean",
+        "caprine-bovidae-v3-yolo11s",
+    ]
+
+    candidatos: list[str] = []
+    if caminho_preferido:
+        candidatos.append(str(caminho_preferido))
+
+    env_model = os.environ.get("OVISION_MODEL_PATH")
+    if env_model and (not caminho_preferido or caminho_preferido == DEFAULT_MODEL_PATH):
+        candidatos.append(env_model)
+
+    for run_name in run_names:
+        candidatos.extend([
+            f"./runs/pose/ovision-yolo/{run_name}/weights/best.pt",
+            f"./runs/pose/onevision-yolo/{run_name}/weights/best.pt",
+            f"./runs/pose/{run_name}/weights/best.pt",
+        ])
+
+    vistos: set[str] = set()
+    for candidato in candidatos:
+        if not candidato or candidato in vistos:
+            continue
+        vistos.add(candidato)
+
+        if os.path.exists(candidato):
+            return candidato
+
+        cand_path = Path(candidato)
+        if not cand_path.is_absolute():
+            rel_to_root = root / cand_path
+            if rel_to_root.exists():
+                return str(rel_to_root)
+
+    return str(caminho_preferido)
+
+
+def _serializar_keypoints(kpts) -> list[dict[str, Any]]:
+    """Converte o tensor/array de keypoints (17 x 3) para uma lista JSON-serializável."""
+    serializados = []
+    for i, ponto in enumerate(kpts):
+        nome = AP10K_KEYPOINTS[i] if i < len(AP10K_KEYPOINTS) else f"kpt_{i}"
+        serializados.append({
+            "index": i,
+            "name": nome,
+            "x": round(float(ponto[0]), 2),
+            "y": round(float(ponto[1]), 2),
+            "conf": round(float(ponto[2]), 4),
+        })
+    return serializados
+
+
+def executar_inferencia_imagem(
+    img_bgr: np.ndarray,
+    original_filename: str = "",
+    model_path: str = DEFAULT_MODEL_PATH,
+    dist_cm: Optional[float] = None,
+    conf_thresh: float = 0.25,
+    ground_truth_file: Optional[str] = None,
+    imgsz: int = 1280,
+    model: Optional[YOLO] = None,
+    render_image: bool = True,
+    verbose: bool = False,
+    base_dir: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Executa a inferência YOLO Pose em uma imagem BGR em memória e retorna as medidas
+    biométricas, keypoints brutos e a imagem anotada (quando render_image=True).
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        return None
+
+    resolved_model_path = resolver_modelo_padrao(model_path, base_dir=base_dir)
+    tag_modelo, nome_run_modelo = extrair_identificador_modelo(resolved_model_path)
+    distancia = float(dist_cm) if dist_cm is not None else deduzir_distancia_camera(original_filename)
+
+    if model is None:
+        if verbose:
+            print(f"\nCarregando modelo YOLO Pose: {resolved_model_path} [tag: {tag_modelo}]...")
+        model = YOLO(resolved_model_path)
+
+    if verbose:
+        label_origem = original_filename or "imagem em memória"
+        print(f"Processando imagem: {label_origem} (Distância: {distancia:.0f} cm | imgsz={imgsz})...")
+
+    # Em modelos YOLO Pose, a confiança da bounding box costuma saturar abaixo de ~0.88,
+    # enquanto keypoints chegam a 0.99+. Usamos limiar base no NMS e validamos caixa OU keypoints.
+    nms_conf = min(float(conf_thresh), 0.25)
+    results = model(img_bgr, conf=nms_conf, imgsz=imgsz, verbose=False)
+
+    if not results or len(results[0]) == 0 or results[0].keypoints is None:
+        if verbose:
+            print("Nenhum animal detectado na imagem.")
+        return None
+
+    result = results[0]
+    h, w = img_bgr.shape[:2]
+    kpts_data = result.keypoints.data.cpu().numpy()
+    boxes_conf = (
+        result.boxes.conf.cpu().numpy()
+        if (result.boxes is not None and result.boxes.conf is not None)
+        else np.ones(len(kpts_data))
+    )
+    boxes_xyxy = (
+        result.boxes.xyxy.cpu().numpy()
+        if (result.boxes is not None and result.boxes.xyxy is not None)
+        else None
+    )
+
+    dados_validacao = None
+    if ground_truth_file and os.path.exists(ground_truth_file) and original_filename:
+        try:
+            with open(ground_truth_file, "r", encoding="utf-8") as f:
+                banco = {item["id_array"]: item for item in json.load(f)}
+                match_id = re.match(r"^(\d+)", os.path.basename(original_filename))
+                if match_id:
+                    dados_validacao = banco.get(int(match_id.group(1)))
+        except Exception as e:
+            if verbose:
+                print(f"Aviso ao ler teste: {e}")
+
+    detecoes_validas = []
+    for idx_det, kpts in enumerate(kpts_data):
+        confs = [float(p[2]) for p in kpts]
+        pts_bons = sum(1 for c in confs if c >= 0.35)
+        if pts_bons >= 6:
+            box_c = float(boxes_conf[idx_det]) if idx_det < len(boxes_conf) else 0.0
+            box_coords = boxes_xyxy[idx_det] if (boxes_xyxy is not None and idx_det < len(boxes_xyxy)) else None
+            top6_kpt_c = float(np.mean(sorted(confs, reverse=True)[:6]))
+            if max(box_c, top6_kpt_c) >= conf_thresh:
+                detecoes_validas.append((pts_bons, float(np.mean(confs)), kpts, box_coords, box_c))
+
+    if not detecoes_validas:
+        if verbose:
+            print("Aviso: Nenhum animal com confiança suficiente nos keypoints foi detectado.")
+        return None
+
+    detecoes_validas.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    img_anotada = img_bgr.copy() if render_image else None
+    estimativas_principal = None
+    raw_keypoints_principal = None
+    bbox_principal = None
+    box_conf_principal = None
+
+    for idx, (_, _, kpts, box_coords, box_c) in enumerate(detecoes_validas):
+        estimativas = estimar_biometria_autonoma(kpts, dist_cm=distancia, img_w=w)
+        if idx == 0:
+            estimativas_principal = estimativas
+            raw_keypoints_principal = _serializar_keypoints(kpts)
+            bbox_principal = [round(float(v), 2) for v in box_coords[:4]] if box_coords is not None else None
+            box_conf_principal = round(float(box_c), 4)
+
+        if verbose:
+            print("\n==============================================")
+            print("     PREVISÕES BIOMÉTRICAS AUTÔNOMAS DA IA    ")
+            print("==============================================")
+            print(f" > PESO VIVO PREVISTO:      {estimativas.get('peso_estimado_kg', 0):.2f} kg")
+            print(f" > Altura da Cernelha:      {estimativas.get('altura_cernelha_cm', 0):.1f} cm")
+            print(f" > Altura da Garupa:        {estimativas.get('altura_garupa_cm', 0):.1f} cm")
+            print(f" > Comprimento Corporal:    {estimativas.get('comprimento_cm', 0):.1f} cm")
+            print(f" > Perímetro Torácico:      {estimativas.get('circ_torax_cm', 0):.1f} cm")
+            print(f" > Grossura do Pescoço:     {estimativas.get('grossura_pescoco_cm', 0):.1f} cm")
+            print("==============================================")
+
+        if dados_validacao and verbose:
+            metricas_validacao = [
+                ("Peso Vivo", estimativas.get("peso_estimado_kg"), extrair_valor_gabarito(dados_validacao, "peso_kg", "peso", "peso_real_kg"), "kg"),
+                ("Altura Cernelha", estimativas.get("altura_cernelha_cm"), extrair_valor_gabarito(dados_validacao, "altura_cernelha_cm", "cernelha_cm", "altura_cernelha"), "cm"),
+                ("Altura Garupa", estimativas.get("altura_garupa_cm"), extrair_valor_gabarito(dados_validacao, "altura_garupa_cm", "garupa_cm", "altura_garupa"), "cm"),
+                ("Comprimento Corporal", estimativas.get("comprimento_cm"), extrair_valor_gabarito(dados_validacao, "comprimento_cm", "comprimento", "comprimento_corpo_cm"), "cm"),
+                ("Perímetro Torácico", estimativas.get("circ_torax_cm"), extrair_valor_gabarito(dados_validacao, "circ_do_torax", "circ_torax_cm", "perimetro_torax_cm", "perimetro_toracico_cm"), "cm"),
+                ("Grossura do Pescoço", estimativas.get("grossura_pescoco_cm"), extrair_valor_gabarito(dados_validacao, "pescoco_circ_medio", "grossura_pescoco_cm", "pescoco_cm"), "cm"),
+            ]
+
+            print("\n----------------------------------------------")
+            print("         RELATÓRIO DE VALIDAÇÃO DE TESTE      ")
+            print("----------------------------------------------")
+            for nome, est_v, real_v, und in metricas_validacao:
+                if real_v is not None and est_v is not None:
+                    diff = abs(est_v - real_v)
+                    pct_err = (diff / real_v) * 100 if real_v > 0 else 0
+                    print(f" > {nome:<20}: Est = {est_v:5.1f} {und} | Real = {real_v:5.1f} {und} | Erro = {diff:4.1f} {und} ({pct_err:4.1f}%)")
+                elif est_v is not None:
+                    print(f" > {nome:<20}: Est = {est_v:5.1f} {und} | Real =  N/A")
+            print("----------------------------------------------")
+
+        if render_image and img_anotada is not None:
+            img_anotada = desenhar_painel_ovision(
+                img_anotada,
+                kpts,
+                estimativas,
+                dados_validacao,
+                nome_modelo=f"{nome_run_modelo} ({tag_modelo})",
+                bbox=box_coords,
+                box_conf=box_c,
+            )
+
+    return {
+        "estimativas": estimativas_principal,
+        "raw_keypoints": raw_keypoints_principal,
+        "bbox": bbox_principal,
+        "box_conf": box_conf_principal,
+        "img_anotada": img_anotada,
+        "dados_validacao": dados_validacao,
+        "tag_modelo": tag_modelo,
+        "nome_run_modelo": nome_run_modelo,
+        "model_path": resolved_model_path,
+        "distancia_cm": distancia,
+        "conf_thresh": float(conf_thresh),
+        "imgsz": int(imgsz),
+    }
+
+
+def executar_inferencia(
+    image_path: str,
+    model_path: str = DEFAULT_MODEL_PATH,
+    dist_cm: Optional[float] = None,
+    conf_thresh: float = 0.25,
+    ground_truth_file: Optional[str] = None,
+    imgsz: int = 1280,
+    model: Optional[YOLO] = None,
+    save_image: bool = True,
+    verbose: bool = True,
+) -> Optional[dict[str, Any]]:
+    """Wrapper baseado em arquivo para execução via CLI e scripts em lote."""
+    if not os.path.exists(image_path):
+        print(f"ERRO: Imagem '{image_path}' não encontrada.")
+        return None
+
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"ERRO: Não foi possível carregar a imagem '{image_path}'.")
+        return None
+
+    resultado = executar_inferencia_imagem(
+        img_bgr=img,
+        original_filename=os.path.basename(image_path),
+        model_path=model_path,
+        dist_cm=dist_cm,
+        conf_thresh=conf_thresh,
+        ground_truth_file=ground_truth_file,
+        imgsz=imgsz,
+        model=model,
+        render_image=save_image,
+        verbose=verbose,
+    )
+    if resultado is None:
+        return None
+
+    caminho_saida = None
+    if save_image and resultado.get("img_anotada") is not None:
+        caminho_saida = gerar_caminho_saida_incremental(image_path, resultado["tag_modelo"], out_dir="outputs")
+        cv2.imwrite(caminho_saida, resultado["img_anotada"])
+        if verbose:
+            print(f"\nImagem com esqueleto e biometria salva em: {caminho_saida}")
+
+    return {
+        "image_path": image_path,
+        "estimativas": resultado["estimativas"],
+        "dados_validacao": resultado["dados_validacao"],
+        "caminho_saida": caminho_saida,
+        "tag_modelo": resultado["tag_modelo"],
+        "nome_run_modelo": resultado["nome_run_modelo"],
+        "distancia_cm": resultado["distancia_cm"],
+        "raw_keypoints": resultado["raw_keypoints"],
+    }

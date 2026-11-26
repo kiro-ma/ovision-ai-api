@@ -1,0 +1,17 @@
+.venv/
+/dataset_versions
+/outputs
+/media
+/runs
+*.pt
+*.engine
+*.onnx
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+db.sqlite3
+db.sqlite3-journal
+.env
+*.log
